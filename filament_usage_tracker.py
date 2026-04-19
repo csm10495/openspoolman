@@ -231,6 +231,8 @@ class FilamentUsageTracker:
     self._layer_tracking_start_time = None
     self._pending_usage_mm = {}
     self._mc_remaining_time_minutes = None
+    self._last_tray_tar = None
+    self._last_consumed_filament = None
 
   def set_print_metadata(self, metadata: dict | None) -> None:
     metadata = metadata or {}
@@ -268,6 +270,7 @@ class FilamentUsageTracker:
       self._handle_print_start(print_obj)
 
     if command == "push_status":
+      self._handle_tray_now_update(print_obj)
       if "layer_num" in print_obj:
         last_layer = self.current_layer
         layer = print_obj["layer_num"]
@@ -593,6 +596,7 @@ class FilamentUsageTracker:
 
     consumeSpool(spool_id, use_length=usage_rounded)
 
+    self._last_consumed_filament = filament
     if self.print_id:
       update_filament_spool(self.print_id, filament_key, spool_id)
       update_filament_grams_used(self.print_id, filament_key, grams_rounded, length_used=cumulative_length)
@@ -619,6 +623,8 @@ class FilamentUsageTracker:
     self._mc_remaining_time_minutes = None
     self.cumulative_length_used = {}
     self.cumulative_grams_used = {}
+    self._last_tray_tar = None
+    self._last_consumed_filament = None
 
   def _is_abort_state(self, state: str | None) -> bool:
     if not state:
@@ -803,6 +809,69 @@ class FilamentUsageTracker:
       if spool.get("id") == spool_id:
         return spool
     return None
+
+  def _parse_tray_value(self, value) -> int | None:
+    if value is None:
+      return None
+    try:
+      parsed = int(value)
+    except (TypeError, ValueError):
+      return None
+    if parsed < 0:
+      return None
+    return parsed
+
+  def _handle_tray_now_update(self, print_obj: dict) -> None:
+    if not self.using_ams or self.ams_mapping is None:
+      return
+
+    ams_data = print_obj.get("ams") or {}
+    tray_tar = self._parse_tray_value(print_obj.get("tray_tar"))
+    if tray_tar is None:
+      tray_tar = self._parse_tray_value(ams_data.get("tray_tar"))
+    tray_now = self._parse_tray_value(print_obj.get("tray_now"))
+    if tray_now is None:
+      tray_now = self._parse_tray_value(ams_data.get("tray_now"))
+
+    if tray_tar is not None:
+      self._last_tray_tar = tray_tar
+
+    if tray_now is None or tray_now == 255:
+      return
+
+    target_tray = tray_tar if tray_tar is not None else self._last_tray_tar
+
+    candidate_indices = []
+    if target_tray is not None:
+      candidate_indices = [
+          idx for idx, mapped in enumerate(self.ams_mapping)
+          if mapped == target_tray
+      ]
+    if (
+        not candidate_indices
+        and self._last_consumed_filament is not None
+        and self._last_consumed_filament < len(self.ams_mapping)
+    ):
+      candidate_indices = [self._last_consumed_filament]
+
+    updated = False
+    for idx in candidate_indices:
+      if idx >= len(self.ams_mapping):
+        continue
+      if self.ams_mapping[idx] == tray_now:
+        continue
+      log(f"[filament-tracker] Tray change detected for filament {idx}: {self.ams_mapping[idx]} -> {tray_now}")
+      self.ams_mapping[idx] = tray_now
+      self._filament_spool_id_map.pop(idx, None)
+      if self.print_metadata is not None:
+        ams_mapping = self.print_metadata.setdefault("ams_mapping", [])
+        while len(ams_mapping) <= idx:
+          ams_mapping.append(None)
+        ams_mapping[idx] = tray_now
+      updated = True
+
+    if updated:
+      self._flush_all_pending_usage()
 
   def _load_model(self, model_path: str, gcode_file: str | None) -> None:
     gcode = extract_gcode_from_3mf(model_path, gcode_file)
