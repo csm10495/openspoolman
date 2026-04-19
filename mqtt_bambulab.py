@@ -248,13 +248,62 @@ def map_filament(tray_tar):
   
   return False
   
+def _coerce_tray_id(value: Any) -> int | None:
+  """Convert a raw MQTT tray identifier to an int, ignoring sentinel values."""
+  if value is None:
+    return None
+  try:
+    parsed = int(value)
+  except (TypeError, ValueError):
+    return None
+  # 254/255 are Bambu sentinels meaning "transitional" / "no tray loaded".
+  if parsed in (254, 255):
+    return None
+  return parsed
+
+
+def _detect_ams_spool_refill(current_state: dict, last_state: dict) -> None:
+  """
+  Detect AMS auto-refill (spool backup) swaps mid-print.
+
+  When the printer's currently loaded tray (`ams.tray_now`) changes from one
+  real tray to another real tray that is NOT part of the planned ams_mapping,
+  the firmware has activated a backup spool to continue printing the same
+  logical filament. Notify the layer-tracking layer so subsequent usage is
+  credited to the new spool.
+  """
+  if not TRACK_LAYER_USAGE:
+    return
+
+  last_print = (last_state or {}).get("print") or {}
+  cur_print = (current_state or {}).get("print") or {}
+
+  last_now = _coerce_tray_id((last_print.get("ams") or {}).get("tray_now"))
+  cur_now = _coerce_tray_id((cur_print.get("ams") or {}).get("tray_now"))
+
+  if last_now is None or cur_now is None or last_now == cur_now:
+    return
+
+  # Only attempt detection while we are actually printing - avoids reacting to
+  # tray swaps performed manually between prints.
+  if cur_print.get("gcode_state") not in ("RUNNING", "PAUSE"):
+    return
+
+  try:
+    FILAMENT_TRACKER.handle_ams_spool_refill(last_now, cur_now)
+  except Exception as exc:  # defensive: never let detection break MQTT processing
+    log(f"[ams-refill] Error while handling AMS spool refill: {exc}")
+
+
 def processMessage(data):
   global LAST_AMS_CONFIG, PRINTER_STATE, PRINTER_STATE_LAST, PENDING_PRINT_METADATA
 
    # Prepare AMS spending estimation
   if "print" in data:    
     update_dict(PRINTER_STATE, data)
-    
+
+    _detect_ams_spool_refill(PRINTER_STATE, PRINTER_STATE_LAST)
+
     if data["print"].get("command") == "project_file" and data["print"].get("url"):
       PENDING_PRINT_METADATA = getMetaDataFrom3mf(data["print"]["url"])
       PENDING_PRINT_METADATA["print_type"] = PRINTER_STATE["print"].get("print_type")

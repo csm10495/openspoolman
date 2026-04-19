@@ -402,6 +402,48 @@ class FilamentUsageTracker:
 
     self._handle_print_start(fake_print)
 
+  def handle_ams_spool_refill(self, previous_tray: int, new_tray: int) -> bool:
+    """
+    Handle an AMS auto-refill (spool backup) swap that happened mid-print.
+
+    When the printer's currently-loaded tray (`ams.tray_now`) changes from a
+    real tray to another real tray that was NOT part of the planned
+    `ams_mapping`, the firmware has activated a backup spool to continue
+    printing the same logical filament. We rebind that filament index so all
+    subsequent per-layer consumption is credited to the new tray's spool.
+
+    Returns True when the mapping was updated, False otherwise.
+    """
+    if not self.using_ams or not self.ams_mapping:
+      return False
+
+    if previous_tray == new_tray:
+      return False
+
+    # The new tray must not already be part of the planned mapping; otherwise
+    # this is a normal planned filament change in a multi-color print.
+    if new_tray in self.ams_mapping:
+      return False
+
+    if previous_tray not in self.ams_mapping:
+      return False
+
+    refill_idx = self.ams_mapping.index(previous_tray)
+    log(
+        f"[filament-tracker] AMS spool backup activated for filament {refill_idx}: "
+        f"tray {previous_tray} -> {new_tray}"
+    )
+
+    new_mapping = list(self.ams_mapping)
+    new_mapping[refill_idx] = new_tray
+
+    # Drop cached binding/spool data for the refilled filament so the next
+    # consumption resolves the new tray's spool.
+    self._filament_spool_id_map.pop(refill_idx, None)
+
+    self.apply_ams_mapping(new_mapping)
+    return True
+
   def apply_ams_mapping(self, ams_mapping: list[int] | None) -> None:
     if not ams_mapping:
       return
