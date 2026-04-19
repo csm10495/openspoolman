@@ -231,6 +231,7 @@ class FilamentUsageTracker:
     self._layer_tracking_start_time = None
     self._pending_usage_mm = {}
     self._mc_remaining_time_minutes = None
+    self._last_tray_tar = None  # Track the last tray_tar to detect changes
 
   def set_print_metadata(self, metadata: dict | None) -> None:
     metadata = metadata or {}
@@ -263,6 +264,21 @@ class FilamentUsageTracker:
         self._mc_remaining_time_minutes = float(print_obj["mc_remaining_time"])
       except (TypeError, ValueError):
         self._mc_remaining_time_minutes = None
+
+    # Detect tray changes during active printing
+    if self.active_model is not None and self.gcode_state == "RUNNING":
+      ams_info = print_obj.get("ams", {})
+      if isinstance(ams_info, dict):
+        tray_tar = ams_info.get("tray_tar")
+        if tray_tar is not None and tray_tar != "255":
+          try:
+            tray_tar_int = int(tray_tar)
+            if self._last_tray_tar is not None and self._last_tray_tar != tray_tar_int:
+              log(f"[filament-tracker] Detected tray change: {self._last_tray_tar} -> {tray_tar_int}")
+              self.handle_tray_change(tray_tar_int)
+            self._last_tray_tar = tray_tar_int
+          except (ValueError, TypeError):
+            pass
 
     if command == "project_file":
       self._handle_print_start(print_obj)
@@ -419,6 +435,27 @@ class FilamentUsageTracker:
     self._maybe_update_predicted_total()
     self._update_layer_tracking_progress()
 
+  def handle_tray_change(self, tray_tar: int) -> None:
+    """
+    Handle a tray change during an active print.
+    This is called when the printer switches to a different tray (e.g., auto-refill).
+    We need to invalidate cached spool mappings for any filament that uses this tray.
+    """
+    if not self.using_ams or self.ams_mapping is None:
+      return
+
+    # Find which filament index (if any) is mapped to this tray
+    for filament_idx, mapped_tray in enumerate(self.ams_mapping):
+      if mapped_tray == tray_tar:
+        # Clear the cached spool ID for this filament so it gets re-looked-up
+        if filament_idx in self._filament_spool_id_map:
+          old_spool_id = self._filament_spool_id_map[filament_idx]
+          log(f"[filament-tracker] Tray {tray_tar} changed for filament {filament_idx}, clearing cached spool {old_spool_id}")
+          del self._filament_spool_id_map[filament_idx]
+
+        # Flush any pending usage with the new spool lookup
+        self._flush_all_pending_usage()
+
   def _retrieve_model(self, model_url: str | None) -> str | None:
     if not model_url:
       log("[filament-tracker] No model URL provided")
@@ -484,6 +521,7 @@ class FilamentUsageTracker:
     self.print_id = None
     self.cumulative_grams_used = {}
     self.cumulative_length_used = {}
+    self._last_tray_tar = None
     self._reset_layer_tracking_state()
     clear_checkpoint()
 
@@ -509,6 +547,7 @@ class FilamentUsageTracker:
     self.print_id = None
     self.cumulative_grams_used = {}
     self.cumulative_length_used = {}
+    self._last_tray_tar = None
     self._reset_layer_tracking_state()
     clear_checkpoint()
 
